@@ -1,22 +1,20 @@
 use tokio::net::UdpSocket;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use chrono::Utc;
 use colored::*;
 use serde::{Deserialize, Serialize};
+use axum::{routing::get, Json, Router, extract::State};
+use tower_http::cors::CorsLayer;
 use std::fs;
 use std::path::Path;
+use std::num::NonZeroU32;
 use notify::{Watcher, RecursiveMode};
 use governor::{Quota, RateLimiter, state::direct::NotKeyed};
-use nonzero_ext::*;
 
-#[derive(Deserialize, Clone, Debug)]
-struct Sensor {
-    id: String,
-    ip: std::net::IpAddr,
-    protocol: String,
-}
+// --- DATA STRUCTURES ---
 
 #[derive(Deserialize, Clone, Debug)]
 struct Config {
@@ -26,21 +24,19 @@ struct Config {
 }
 
 #[derive(Deserialize, Clone, Debug)]
-struct ServerConfig {
-    listen_addr: String,
-    target_addr: String,
-    max_pps: u32,
-}
+struct Sensor { id: String, ip: std::net::IpAddr, protocol: String }
 
 #[derive(Deserialize, Clone, Debug)]
-struct AlertConfig {
-    webhook_url: String,
-    enabled: bool,
-}
+struct ServerConfig { listen_addr: String, target_addr: String, max_pps: u32 }
+
+#[derive(Deserialize, Clone, Debug)]
+struct AlertConfig { webhook_url: String, enabled: bool }
 
 #[derive(Serialize)]
-struct WebhookPayload {
-    content: String,
+struct Stats {
+    total_packets: u64,
+    blocked_packets: u64,
+    active_blacklist_count: usize,
 }
 
 struct WafState {
@@ -48,19 +44,33 @@ struct WafState {
     limiters: DashMap<std::net::IpAddr, Arc<RateLimiter<NotKeyed, governor::state::InMemoryState, governor::clock::DefaultClock>>>,
     config: ArcSwap<Config>,
     http_client: reqwest::Client,
+    total_processed: AtomicU64,
+    total_blocked: AtomicU64,
+}
+
+// --- WEB SERVER HANDLER ---
+
+async fn get_stats(State(state): State<Arc<WafState>>) -> Json<Stats> {
+    Json(Stats {
+        total_packets: state.total_processed.load(Ordering::Relaxed),
+        blocked_packets: state.total_blocked.load(Ordering::Relaxed),
+        active_blacklist_count: state.blacklist.len(),
+    })
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let initial_config = load_config()?;
+    let initial_config = load_config().expect("config.toml not found!");
     let state = Arc::new(WafState {
         blacklist: DashMap::new(),
         limiters: DashMap::new(),
         config: ArcSwap::from_pointee(initial_config),
         http_client: reqwest::Client::new(),
+        total_processed: AtomicU64::new(0),
+        total_blocked: AtomicU64::new(0),
     });
 
-    // Monitoraggio config.toml
+    // --- HOT RELOAD WATCHER ---
     let state_clone = Arc::clone(&state);
     let mut watcher = notify::recommended_watcher(move |res| {
         if let Ok(_) = res {
@@ -72,16 +82,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     watcher.watch(Path::new("config.toml"), RecursiveMode::NonRecursive)?;
 
+    // --- WEB SERVER FOR GUI ---
+    let app_state = Arc::clone(&state);
+    let app = Router::new()
+        .route("/api/stats", get(get_stats))
+        .layer(CorsLayer::permissive())
+        .with_state(app_state);
+
+    tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+        println!("{} http://localhost:3000/api/stats", " API SERVER ONLINE:".green().bold());
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // --- UDP CORE ENGINE ---
     let listen_addr = state.config.load().server.listen_addr.clone();
     let socket = Arc::new(UdpSocket::bind(&listen_addr).await?);
 
     println!("{}", "===============================================".cyan());
-    println!("{}", "   CENTURIA SAF v1.1 - ALERT SYSTEM ACTIVE     ".bold().cyan());
-    println!("   Webhook Alerts: {}", if state.config.load().alerts.enabled { "ENABLED".green() } else { "DISABLED".red() });
+    println!("{}", "   CENTURIA SAF v1.2 - CORE ENGINE             ".bold().cyan());
+    println!("   Status: {} | API: {}", "ONLINE".green(), "3000".blue());
     println!("{}", "===============================================".cyan());
 
     let mut buf = [0u8; 4096];
-
     loop {
         let (len, src) = socket.recv_from(&mut buf).await?;
         let state = Arc::clone(&state);
@@ -89,36 +112,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let packet = buf[..len].to_vec();
 
         tokio::spawn(async move {
+            state.total_processed.fetch_add(1, Ordering::Relaxed);
             let ip = src.ip();
             let cfg = state.config.load();
 
-            if state.blacklist.get(&ip).map_or(false, |f| *f >= 10) { return; }
+            if state.blacklist.get(&ip).map_or(false, |f| *f >= 10) {
+                state.total_blocked.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
 
             let limiter = state.limiters.entry(ip).or_insert_with(|| {
-                Arc::new(RateLimiter::direct(Quota::per_second(nonzero!(cfg.server.max_pps))))
+                let pps = NonZeroU32::new(cfg.server.max_pps).unwrap_or(NonZeroU32::new(1).unwrap());
+                Arc::new(RateLimiter::direct(Quota::per_second(pps)))
             });
 
             if let Err(_) = limiter.check() {
-                let msg = format!("DDoS Attack detected from IP: {}", ip);
-                log_event("DDOS_ATTACK", &msg, src, "red");
-                send_alert(&state, &msg).await;
+                log_event("DDOS_ATTACK", &format!("Rate limit exceeded for {}", ip), src, "red");
+                state.total_blocked.fetch_add(1, Ordering::Relaxed);
                 state.blacklist.insert(ip, 100);
                 return;
             }
 
             let sensor = cfg.sensors.iter().find(|s| s.ip == ip);
-            if sensor.is_none() {
-                log_event("UNAUTHORIZED", "Possible Redirect/Spoofing", src, "red");
-                return;
-            }
-            let s_info = sensor.unwrap();
-
-            if !validate_packet(&s_info.protocol, &packet) {
-                let msg = format!("Malformed packet (DPI Reject) from Sensor: {}", s_info.id);
-                log_event("MALFORMED", &msg, src, "red");
-                send_alert(&state, &msg).await;
-                let mut entry = state.blacklist.entry(ip).or_insert(0);
-                *entry += 1;
+            if sensor.is_none() || !validate_packet(&sensor.unwrap().protocol, &packet) {
+                log_event("SECURITY_REJECT", "Invalid protocol or unauthorized IP", src, "red");
+                state.total_blocked.fetch_add(1, Ordering::Relaxed);
+                state.blacklist.entry(ip).and_modify(|e| *e += 1).or_insert(1);
                 return;
             }
 
@@ -127,25 +146,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-async fn send_alert(state: &WafState, message: &str) {
-    let cfg = state.config.load();
-    if !cfg.alerts.enabled { return; }
-
-    let payload = WebhookPayload {
-        content: format!("⚠️ **CENTURIA SAF ALERT** ⚠️\n> {}", message),
-    };
-
-    let _ = state.http_client
-        .post(&cfg.alerts.webhook_url)
-        .json(&payload)
-        .send()
-        .await;
-}
-
 fn validate_packet(proto: &str, data: &[u8]) -> bool {
     match proto {
         "centuria" => data.len() >= 5 && data.starts_with(b"CE"),
-        "modbus" => data.len() >= 7 && data[7] <= 127,
+        "modbus" => data.len() >= 7 && data[0] != 0,
         _ => !data.is_empty(),
     }
 }
@@ -159,5 +163,3 @@ fn log_event(event: &str, details: &str, src: std::net::SocketAddr, color: &str)
     let evt = if color == "red" { event.red().bold() } else { event.green().bold() };
     println!("[{}] {} | SRC: {} | {}", Utc::now().format("%H:%M:%S"), evt, src.to_string().yellow(), details);
 }
-
-
