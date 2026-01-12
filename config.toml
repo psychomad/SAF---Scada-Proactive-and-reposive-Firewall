@@ -1,1 +1,13 @@
+[server]
+listen_addr = "0.0.0.0:5001"
+target_addr = "127.0.0.1:5000"
+max_pps = 10
 
+[alerts]
+webhook_url = "https://discord.com/api/webhooks/YOUR_ID"
+enabled = true
+
+[[sensors]]
+id = "sensor_alpha"
+ip = "127.0.0.1"
+protocol = "centuria"
