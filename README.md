@@ -28,3 +28,29 @@ centuria-saf/
     └── main.rs         # Core SAF engine (DPI, Rate Limiter, Alerts)
 
 Project is still in development -----
+How to use Centuria SAF
+To start the protection engine, ensure you have Rust installed and follow these steps:
+
+Build the Project: Generate the optimized binary with cargo build --release.
+
+Launch: Run the firewall using cargo run. The system will immediately load security policies from config.toml.
+
+Real-time Monitoring: The terminal will display live logs. Valid packets are marked in green, while DDoS attempts, unauthorized IPs, or malformed packets (DPI Rejects) will appear in red.
+
+Verification: Use the python3 tester.py script to simulate sensor traffic and verify that the SAF correctly forwards legitimate data or drops malicious payloads.
+
+⚙️ Configuring for an existing SCADA network
+Integrating the SAF into a production industrial environment is seamless and does not require modifying your PLCs or existing sensors:
+
+Strategic Positioning: Deploy the SAF (on an Industrial PC or Linux Gateway) between your field sensors and the central SCADA/HMI server.
+
+IP Routing: In config.toml, set listen_addr to the SAF's IP and target_addr to the IP of your SCADA Collector/Historian.
+
+Sensor Whitelisting: Under the [[sensors]] section, add every authorized device by specifying its static IP and the protocol it uses (e.g., centuria or modbus).
+
+Threshold Tuning: Adjust the max_pps (Packets Per Second) based on your hardware's sampling rate. For example, if a sensor sends data every 100ms, a value of max_pps = 15 provides a safe buffer while preventing DDoS floods.
+
+🚨 Alerting Note
+To receive mobile notifications, remember to paste your Discord or Slack Webhook URL in the [alerts] section of config.toml and set enabled = true. This ensures you are notified of critical SCADA security events even when you are away from the control room.
+
+Would you like me to create a "Troubleshooting" section in English in case the sensors have connectivity issues?
