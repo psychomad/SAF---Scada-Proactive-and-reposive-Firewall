@@ -50,6 +50,13 @@ Sensor Whitelisting: Under the [[sensors]] section, add every authorized device 
 
 Threshold Tuning: Adjust the max_pps (Packets Per Second) based on your hardware's sampling rate. For example, if a sensor sends data every 100ms, a value of max_pps = 15 provides a safe buffer while preventing DDoS floods.
 
+## 🦀 Why Rust for SCADA?
+
+Safety and Performance are non-negotiable in Industrial environments. Centuria SAF leverages Rust to provide:
+* **Memory Safety:** Eliminates common vulnerabilities like buffer overflows that are often exploited in legacy C/C++ industrial gateways.
+* **Zero-Cost Abstractions:** Ensures that the Deep Packet Inspection (DPI) engine runs at wire speed with minimal latency.
+* **Concurrency:** Handles multiple sensor streams simultaneously without race conditions, ensuring high availability for critical infrastructure.
+
 🚨 Alerting Note
 To receive mobile notifications, remember to paste your Discord or Slack Webhook URL in the [alerts] section of config.toml and set enabled = true. This ensures you are notified of critical SCADA security events even when you are away from the control room.
 
